@@ -4,11 +4,12 @@ name: build-engine
 # packages on a GitHub Release, and pin deps/v8_hash in the repo. Input may be a
 # V8 commit hash, a Chrome major (e.g. 148), or "latest" (resolved via chromiumdash).
 #
-# Runners are NATIVE (no emulation): ubuntu = x64 (linux/amd64 native, linux/arm64
-# cross — V8 ships only a linux-x64 rust toolchain); macos-latest = arm64 (darwin
-# arm64 native), macos-13 = x64 (darwin amd64 native). build.py disables the V8
-# sandbox so the newer-V8 libc++-hardening assertion passes with the system C++
-# toolchain (cgo.go drops -DV8_ENABLE_SANDBOX to match).
+# Runners: ubuntu = x64 (linux/amd64 native, linux/arm64 cross — V8 ships only a
+# linux-x64 rust toolchain); macos-latest = arm64 (darwin/arm64 native). darwin/amd64
+# is not built. build.py builds with V8's bundled clang (--clang; newer V8 needs clang
+# builtins like __has_warning) against the system libstdc++ (use_custom_libcxx=false) for
+# cgo ABI compat, with use_allocator_shim=false (system libc++ on mac rejects PA's hidden
+# operator new/delete) and the V8 sandbox off (cgo.go drops -DV8_ENABLE_SANDBOX to match).
 
 on:
   workflow_dispatch:
@@ -52,7 +53,6 @@ jobs:
           - { os: linux,  arch: amd64, runner: ubuntu-latest }
           - { os: linux,  arch: arm64, runner: ubuntu-latest }
           - { os: darwin, arch: arm64, runner: macos-latest }
-          - { os: darwin, arch: amd64, runner: macos-13 }
     runs-on: ${{ matrix.runner }}
     env:
       V8_HASH: ${{ needs.resolve.outputs.v8_hash }}
@@ -60,6 +60,8 @@ jobs:
       OSID: ${{ matrix.os }}
       PLATFORM: ${{ matrix.os }}_${{ matrix.arch }}
       TAG: ${{ needs.resolve.outputs.tag }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v5
 
@@ -81,6 +83,14 @@ jobs:
       - name: Toolchain (macos)
         if: runner.os == 'macOS'
         run: brew install ccache ninja || true
+
+      - name: ccache cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-${{ matrix.os }}-${{ matrix.arch }}-${{ needs.resolve.outputs.v8_hash }}
+          restore-keys: |
+            ccache-${{ matrix.os }}-${{ matrix.arch }}-
 
       - name: depot_tools + V8 source @ pinned commit
         shell: bash
