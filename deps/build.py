@@ -90,6 +90,7 @@ icu_use_data_file=false
 v8_enable_test_features=false
 exclude_unwind_tables=true
 v8_android_log_stdout=true
+v8_enable_sandbox=false
 """
 
 def v8deps():
