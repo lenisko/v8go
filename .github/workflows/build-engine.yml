@@ -104,7 +104,7 @@ jobs:
           export PATH="$PWD/deps/depot_tools:$PATH"
           export GCLIENT_SUPPRESS_GIT_VERSION_WARNING=1
           cd deps
-          python3 ./build.py --ccache --verbose --arch "$ARCH" --os "$OSID"
+          python3 ./build.py --ccache --verbose --clang --arch "$ARCH" --os "$OSID"
           python3 ./build_common.py || true
           ls -la "$PLATFORM"/
           grep -h "V8_MAJOR_VERSION\|V8_MINOR_VERSION\|V8_BUILD_NUMBER\|V8_PATCH_LEVEL" include/v8-version.h

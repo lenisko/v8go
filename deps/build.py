@@ -91,7 +91,6 @@ v8_enable_test_features=false
 exclude_unwind_tables=true
 v8_android_log_stdout=true
 v8_enable_sandbox=false
-v8_enable_temporal_support=false
 """
 
 def v8deps():
