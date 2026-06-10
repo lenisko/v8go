@@ -18,10 +18,6 @@ on:
         description: 'V8 commit hash, or Chrome major (e.g. 148), or "latest"'
         required: true
         default: 'latest'
-      release_tag:
-        description: 'Release tag (default: engine-chrome<major> or engine-<shorthash>)'
-        required: false
-        default: ''
 
 permissions:
   contents: write
@@ -40,9 +36,6 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/resolve-v8.py "${{ github.event.inputs.v8 }}"
-          if [ -n "${{ github.event.inputs.release_tag }}" ]; then
-            echo "tag=${{ github.event.inputs.release_tag }}" >> "$GITHUB_OUTPUT"
-          fi
 
   build:
     needs: resolve
@@ -119,6 +112,46 @@ jobs:
           ls -la "$PLATFORM"/
           grep -h "V8_MAJOR_VERSION\|V8_MINOR_VERSION\|V8_BUILD_NUMBER\|V8_PATCH_LEVEL" include/v8-version.h
 
+      - name: Smoke test (cgo link + run JS) -- GATES the upload
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A non-linking engine (e.g. dangling temporal_rs Rust symbols) must
+          # FAIL here, before it can ever reach a Release. Links the freshly
+          # built deps/$PLATFORM via the in-repo module; runs JS when the build
+          # is native, link-only (cross-compile) otherwise.
+          work="$RUNNER_TEMP/smoke"; mkdir -p "$work"
+          cat > "$work/main.go" <<'GO'
+          package main
+          import ( "fmt"; v8 "github.com/lenisko/v8go" )
+          func main() {
+            iso := v8.NewIsolate(); defer iso.Dispose()
+            ctx := v8.NewContext(iso); defer ctx.Close()
+            v, err := ctx.RunScript("[1,2,3].map(x=>x*x).join(',')+'|'+typeof Temporal", "smoke.js")
+            if err != nil { panic(err) }
+            fmt.Println("smoke ok:", v)
+          }
+          GO
+          {
+            echo "module smoke"
+            echo "go 1.21"
+            echo "require github.com/lenisko/v8go v0.0.0"
+            echo "replace github.com/lenisko/v8go => $GITHUB_WORKSPACE"
+            for p in android_amd64 android_arm64 darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+              echo "require github.com/lenisko/v8go/deps/$p v0.0.0"
+              echo "replace github.com/lenisko/v8go/deps/$p => $GITHUB_WORKSPACE/deps/$p"
+            done
+          } > "$work/go.mod"
+          cd "$work"
+          export GOFLAGS=-mod=mod CGO_ENABLED=1
+          if [ "$OSID" = "$(go env GOHOSTOS)" ] && [ "$ARCH" = "$(go env GOHOSTARCH)" ]; then
+            echo "native -> link + run"; go run .
+          else
+            echo "cross ($OSID/$ARCH) -> link-only"
+            if [ "$OSID" = linux ] && [ "$ARCH" = arm64 ]; then export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++; fi
+            GOOS="$OSID" GOARCH="$ARCH" go build -o /dev/null .
+          fi
+
       - name: Package engine (libs + headers)
         shell: bash
         run: |
@@ -147,26 +180,47 @@ jobs:
         with:
           path: dist
 
+      - name: Stage engine in-tree (Model A) + version guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Extract each platform tarball into deps/ (-> deps/<platform>/*.a + deps/include).
+          # This bakes the built libs into the repo so `go get <module>@<tag>` works with
+          # NO download step. include is identical across platforms; last write wins.
+          for tgz in $(find dist -name 'libv8-*.tar.gz'); do
+            echo "extract $tgz"; tar -xzf "$tgz" -C deps
+          done
+          echo "$V8_HASH" > deps/v8_hash
+          # Record the ACTUAL built V8 version from the headers (not a label) so a
+          # mislabel is impossible: the commit + release carry the true version.
+          ver=$(awk '/V8_MAJOR_VERSION/{a=$3}/V8_MINOR_VERSION/{b=$3}/V8_BUILD_NUMBER/{c=$3}/V8_PATCH_LEVEL/{d=$3}END{print a"."b"."c"."d}' deps/include/v8-version.h)
+          echo "BUILT_V8=$ver" | tee -a "$GITHUB_ENV"
+          [ -n "$ver" ] && [ "$ver" != "..." ] || { echo "::error::could not read built V8 version"; exit 1; }
+          test -s deps/darwin_arm64/libv8-0.a   # sanity: libs actually present
+
+      - name: Commit engine in-tree + tag + push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A deps
+          git commit -m "engine: V8 ${BUILT_V8} (${V8_HASH}) ${CVER} [${TAG}]" \
+            || echo "no tree change (rebuilt identical engine)"
+          git push
+          # Tag the commit that CONTAINS the libs, so `go get @<tag>` resolves a tree with the engine.
+          git tag -f "$TAG"
+          git push -f origin "$TAG"
+
       - name: Create/Update Release with engine packages
         shell: bash
         run: |
           set -euo pipefail
           assets=$(find dist -name 'libv8-*.tar.gz')
+          notes="Built V8 ${BUILT_V8} (commit ${V8_HASH}) ${CVER}. Libs committed in-tree at this tag — \`go get\` needs no download. Tarballs below are for non-Go consumers."
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" $assets --clobber
+            gh release edit "$TAG" --title "V8 engine ${BUILT_V8} ${CVER}" --notes "$notes"
           else
-            gh release create "$TAG" $assets \
-              --title "V8 engine ${TAG} ${CVER}" \
-              --notes "V8 commit ${V8_HASH}. Per-platform libv8 packages (static libs + version-matched headers)."
+            gh release create "$TAG" $assets --title "V8 engine ${BUILT_V8} ${CVER}" --notes "$notes"
           fi
-
-      - name: Update repo (pin deps/v8_hash) + push
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "$V8_HASH" > deps/v8_hash
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add deps/v8_hash
-          git commit -m "engine: build V8 ${V8_HASH} (${TAG})" || { echo "no change to commit"; exit 0; }
-          git push
