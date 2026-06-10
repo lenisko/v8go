@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"testing"
 
-	v8 "github.com/tommie/v8go"
+	v8 "github.com/lenisko/v8go"
 )
 
 func TestContextExec(t *testing.T) {

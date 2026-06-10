@@ -14,3 +14,4 @@ c.out
 go.work
 .idea/*
 /v8go.test
+.docker-ccache
