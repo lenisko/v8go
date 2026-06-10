@@ -6,10 +6,12 @@ name: build-engine
 #
 # Runners: ubuntu = x64 (linux/amd64 native, linux/arm64 cross — V8 ships only a
 # linux-x64 rust toolchain); macos-latest = arm64 (darwin/arm64 native). darwin/amd64
-# is not built. build.py builds with V8's bundled clang (--clang; newer V8 needs clang
-# builtins like __has_warning) against the system libstdc++ (use_custom_libcxx=false) for
+# is not built. build.py uses its per-OS default toolchain (linux=gcc, darwin=clang):
+# forcing clang on linux produces objects GNU ld rejects ("incompatible") when a
+# consumer links with g++. Built against system libstdc++ (use_custom_libcxx=false) for
 # cgo ABI compat, with use_allocator_shim=false (system libc++ on mac rejects PA's hidden
-# operator new/delete) and the V8 sandbox off (cgo.go drops -DV8_ENABLE_SANDBOX to match).
+# operator new/delete), the V8 sandbox off (cgo.go drops -DV8_ENABLE_SANDBOX to match),
+# and temporal off (drops the temporal_rs Rust dep that otherwise leaves dangling symbols).
 
 on:
   workflow_dispatch:
@@ -57,6 +59,9 @@ jobs:
       CCACHE_MAXSIZE: 2G
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
 
       - name: Free disk space (linux)
         if: runner.os == 'Linux'
@@ -107,9 +112,19 @@ jobs:
           export PATH="$PWD/deps/depot_tools:$PATH"
           export GCLIENT_SUPPRESS_GIT_VERSION_WARNING=1
           cd deps
-          python3 ./build.py --ccache --verbose --clang --arch "$ARCH" --os "$OSID"
-          python3 ./build_common.py || true
+          # No --clang: use build.py's per-OS default (linux=gcc, darwin=clang).
+          # Forcing clang on linux yields objects GNU ld rejects as "incompatible"
+          # when a consumer links with g++; gcc is upstream's proven linux config.
+          python3 ./build.py --ccache --verbose --arch "$ARCH" --os "$OSID"
+          # Regenerate deps/<platform>/cgo.go from the fresh libmanifest — a build may
+          # emit a different lib count (e.g. 3 vs 2), and a stale cgo.go would link the
+          # wrong -lv8-* set (missing-symbol / partial link). MUST run after build.py.
+          python3 ./update_cgo.py
+          # Regenerate deps/include from the built V8 source — MUST succeed (needs `go`),
+          # else stale headers ship with new libs (header/lib ABI drift). No `|| true`.
+          python3 ./build_common.py
           ls -la "$PLATFORM"/
+          echo "built V8 headers:"
           grep -h "V8_MAJOR_VERSION\|V8_MINOR_VERSION\|V8_BUILD_NUMBER\|V8_PATCH_LEVEL" include/v8-version.h
 
       - name: Smoke test (cgo link + run JS) -- GATES the upload
