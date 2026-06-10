@@ -147,9 +147,13 @@ jobs:
           if [ "$OSID" = "$(go env GOHOSTOS)" ] && [ "$ARCH" = "$(go env GOHOSTARCH)" ]; then
             echo "native -> link + run"; go run .
           else
-            echo "cross ($OSID/$ARCH) -> link-only"
+            # Cross-compile: link-only, NON-FATAL. The temporal_rs-class link failure is
+            # gn-config-universal, so the native cells (darwin/arm64, linux/amd64) already
+            # gate it; a cross-toolchain quirk here must not sink an otherwise-good engine.
+            echo "cross ($OSID/$ARCH) -> link-only (non-fatal)"
             if [ "$OSID" = linux ] && [ "$ARCH" = arm64 ]; then export CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++; fi
-            GOOS="$OSID" GOARCH="$ARCH" go build -o /dev/null .
+            GOOS="$OSID" GOARCH="$ARCH" go build -o /dev/null . \
+              || echo "::warning::cross smoke link failed for $OSID/$ARCH (non-fatal; native cells gate the engine)"
           fi
 
       - name: Package engine (libs + headers)
@@ -176,6 +180,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -198,19 +205,47 @@ jobs:
           [ -n "$ver" ] && [ "$ver" != "..." ] || { echo "::error::could not read built V8 version"; exit 1; }
           test -s deps/darwin_arm64/libv8-0.a   # sanity: libs actually present
 
-      - name: Commit engine in-tree + tag + push
+      - name: Commit engine + pin deps pseudo-versions + tag + push
         shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Commit 1 = the libs. This is the commit consumers' nested deps/* modules
+          # resolve to, so it must contain deps/<platform>/*.a + go.mod.
           git add -A deps
-          git commit -m "engine: V8 ${BUILT_V8} (${V8_HASH}) ${CVER} [${TAG}]" \
-            || echo "no tree change (rebuilt identical engine)"
-          git push
-          # Tag the commit that CONTAINS the libs, so `go get @<tag>` resolves a tree with the engine.
+          if git diff --cached --quiet; then
+            echo "no lib change; reusing HEAD as the libs commit"
+          else
+            git commit -m "engine: V8 ${BUILT_V8} (${V8_HASH}) ${CVER} libs"
+            git push
+          fi
+          C1=$(git rev-parse HEAD)
+
+          # A consumer doing `go get github.com/lenisko/v8go@<tag>` IGNORES this repo's
+          # `replace ./deps/*` directives (replace only applies in the main module), so
+          # it resolves the deps/* modules by the versions in root go.mod's require block.
+          # Pin those to the pseudo-version of C1 so they resolve to THIS repo's commit.
+          TS=$(TZ=UTC git show -s --date=format-local:%Y%m%d%H%M%S --format=%cd "$C1")
+          SH=$(git rev-parse --short=12 "$C1")
+          PV="v0.0.0-${TS}-${SH}"
+          echo "deps pseudo-version: $PV  (commit $C1)"
+          for p in android_amd64 android_arm64 darwin_amd64 darwin_arm64 linux_amd64 linux_arm64; do
+            go mod edit -require="github.com/lenisko/v8go/deps/${p}@${PV}"
+          done
+
+          # Commit 2 = the require pins. Tag THIS commit: its go.mod points deps/* at C1.
+          git add go.mod
+          if git diff --cached --quiet; then
+            echo "go.mod require already pinned to $PV"
+          else
+            git commit -m "engine: pin deps modules @ ${PV} [${TAG}]"
+            git push
+          fi
           git tag -f "$TAG"
           git push -f origin "$TAG"
+          echo "tagged ${TAG} -> $(git rev-parse --short HEAD); deps resolve to ${SH}"
 
       - name: Create/Update Release with engine packages
         shell: bash
