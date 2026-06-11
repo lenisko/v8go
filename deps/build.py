@@ -171,6 +171,32 @@ def apply_patch(patch_name, working_dir):
     patch_path = os.path.join(deps_path, os_arch(), patch_name + ".patch")
     subprocess_check_call(["git", "apply", "-v", patch_path], cwd=working_dir)
 
+def apply_gcc_fixups():
+    # GCC's preprocessor has no __has_warning. In `#if defined(__has_warning)
+    # && __has_warning(...)` the dead operand still has to parse, and the
+    # undefined identifier becomes `0`, leaving `0("...")` -> "missing binary
+    # operator before token" on every TU. Route the calls through a wrapper
+    # that expands to 0 when __has_warning is unavailable; clang behavior is
+    # unchanged (the host toolchain of cross builds still uses clang).
+    guard = (
+        "#if defined(__has_warning)\n"
+        "#define V8GO_HAS_WARNING(x) __has_warning(x)\n"
+        "#else\n"
+        "#define V8GO_HAS_WARNING(x) 0\n"
+        "#endif\n"
+    )
+    for fn in [os.path.join(v8_path, "src", "base", "macros.h")]:
+        with open(fn) as f:
+            src = f.read()
+        if "V8GO_HAS_WARNING" in src or "__has_warning(" not in src:
+            continue
+        src = src.replace("__has_warning(", "V8GO_HAS_WARNING(")
+        marker = "#define V8_BASE_MACROS_H_\n"
+        assert marker in src, fn
+        src = src.replace(marker, marker + "\n" + guard, 1)
+        with open(fn, "w") as f:
+            f.write(src)
+
 def update_last_change():
     out_path = os.path.join(v8_path, "build", "util", "LASTCHANGE")
     subprocess_check_call(["python", "build/util/lastchange.py", "-o", out_path], cwd=v8_path)
@@ -295,6 +321,8 @@ def main():
     v8deps()
     if is_windows:
         apply_mingw_patches()
+    if not is_clang:
+        apply_gcc_fixups()
 
     gn_path = os.path.join(tools_path, "gn")
     assert(os.path.exists(gn_path))
